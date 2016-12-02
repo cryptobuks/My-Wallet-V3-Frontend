@@ -2,6 +2,7 @@
 require 'json'
 require 'open-uri'
 require 'net/http'
+require 'pp'
 
 EXCEPTIONS = [
   "WORD_1", "WORD_2", "WORD_3", "WORD_4", "WORD_5", "WORD_6", "WORD_7", "WORD_8", "WORD_9", "WORD_10", "WORD_11", "WORD_12"
@@ -61,6 +62,7 @@ def create_context(name, parent)
   url = generate_url("/context")
   res = Net::HTTP.post_form(url, context_name: name, parent_context: parent)
   response = JSON.parse(res.body)
+
   if response["status"]["code"] != 0
     puts "Create context #{ name } failed:"
     puts response["errors"]
@@ -70,9 +72,35 @@ def create_context(name, parent)
   return response["results"]["uuid"]
 end
 
-def post_word(key, english, context)
+def get_phrase_keys(context)
+  url = generate_context_url('phrases', context)
+  res = Net::HTTP.get(url)
+  response = JSON.parse(res)
+  if response["status"]["code"] != 0
+    puts "List contexts failed:"
+    puts response["errors"]
+    exit(1)
+  end
+
+  return response["results"].collect{|result| result["phrase_key"] }
+end
+
+def post_phrase(key, english, context)
   url = generate_context_url('phrases', context)
   res = Net::HTTP.post_form(url, source_language: 'english', phrase_key: key, source_text: english)
+end
+
+def delete_phrase(context, key)
+  uri = generate_context_url("phrase/#{ key }", context)
+  http = Net::HTTP.new("www.onehourtranslation.com")
+  request = Net::HTTP::Delete.new(uri.request_uri)
+  res = http.request(request)
+  response = JSON.parse(res.body)
+  if response["status"]["code"] != 0
+    puts "Delete phrase #{ key } from context #{ context } failed:"
+    puts response["msg"]
+    exit(1)
+  end
 end
 
 def post_translation(key, language, translation, context)
@@ -87,6 +115,42 @@ def post_translation(key, language, translation, context)
     puts response["errors"]
     exit(1)
   end
+end
+
+def move_phrase_to_context(new_context)
+  url = generate_context_url("phrase/#{ key }", context)
+  res = Net::HTTP.post_form(url, context: new_context)
+  response = JSON.parse(res.body)
+  if response["status"]["code"] != 0
+    puts "Moving #{ key } to context #{ new_context } failed:"
+    puts response["errors"]
+    exit(1)
+  end
+  puts response["result"]
+end
+
+def get_context_tree(parent)
+  remote_contexts = list_contexts()
+
+  def process_context(contexts, parent, remote_contexts)
+    for context in remote_contexts
+      if context["parent"] == parent
+        contexts[context["name"]] = process_context({uuid: context["uuid"]}, context["uuid"], remote_contexts)
+      end
+    end
+    return contexts
+  end
+
+  for context in remote_contexts
+    if context["uuid"] == parent
+      parent_name = context["name"]
+    end
+  end
+
+  res = {}
+  res[parent_name] = process_context({uuid: parent}, parent, remote_contexts)
+
+  return res
 end
 
 case ARGV[0]
@@ -133,10 +197,10 @@ when "upload"
     translations[language] = JSON.load(File.read(path))
   end
 
-  def process_word_or_context(n, key, obj, translations, context_key=nil, context=nil)
+  def process_phrase_or_context(n, key, obj, translations, context_key=nil, context=nil)
     if obj.is_a?(String)
       puts "#{ "  " * n }#{ key }"
-      post_word(key, obj, context)
+      post_phrase(key, obj, context)
       for language in OTHER_LANGUAGES
         translation = translations[language][key]
         if !translation.nil?
@@ -156,7 +220,7 @@ when "upload"
 
       for sub_key, sub_obj in obj
         if !EXCEPTIONS.include?(sub_key)
-          process_word_or_context(n + 1, sub_key, sub_obj, sub_translations, key, c)
+          process_phrase_or_context(n + 1, sub_key, sub_obj, sub_translations, key, c)
         end
       end
     end
@@ -164,9 +228,106 @@ when "upload"
 
   for key, obj in JSON.parse(File.read('locales/en-human.json'))
     if !EXCEPTIONS.include?(key)
-      process_word_or_context(0, key, obj, translations, nil, ARGV[1])
+      process_phrase_or_context(0, key, obj, translations, nil, ARGV[1])
     end
   end
+when "new_contexts"
+  exit 1 if !ARGV[1]
+
+  local_phrases = JSON.parse(File.read('locales/en-human.json'))
+  contexts = get_context_tree(ARGV[1])
+
+  def post_new_contexts(contexts, local_phrases)
+    throw "local_phrases missing" if !local_phrases
+    for key, value in local_phrases
+      if !value.is_a?(String) # Context
+        if !contexts[key]
+          c = create_context(key, contexts[:uuid])
+          puts "Context created: #{ c } - #{ key }"
+        end
+      end
+    end
+  end
+
+  post_new_contexts(contexts["wallet_web"], local_phrases)
+
+when "delete"
+  exit 1 if !ARGV[1]
+  # Run first:
+  # orpahaned
+  # new_contexts
+
+  # This downloads the most recent phrase list from OneHour and compares it to
+  # the local list. It deletes all phrases from OneHour that are no longer
+  # used locally. Before deleting it will check if the phrases have moved to a
+  # subcontext. This only works if you use the same key.
+  local_phrases = JSON.parse(File.read('locales/en-human.json'))
+
+  contexts = get_context_tree(ARGV[1])
+
+  pp contexts
+
+  def find_context_for_phrase(phrase_key, contexts, local_phrases)
+    throw "local_phrases missing" if !local_phrases
+    for key, value in contexts
+      if key != :uuid
+        if !local_phrases[key] # orphaned context
+          next
+        else
+          puts "Recurse into context #{ value }"
+          res = find_context_for_phrase(phrase_key, value, local_phrases[key])
+          if res
+            return res
+          end
+        end
+      else
+        res = local_phrases[phrase_key]
+        if res
+          return res[:uuid]
+        end
+      end
+    end
+    return nil
+  end
+
+  # PENDING API ISSUE, CHECK IF THIS WORKS BEFORE RUNNING THE SCRIPT BELOW
+  puts find_context_for_phrase("WHAT_IS_BITCOIN", contexts["wallet_web"], local_phrases)
+  exit(0)
+  ######################
+
+  def delete_unused_phrases_and_contexts(name, contexts, local_phrases)
+    for key, value in contexts
+      if key != :uuid
+        if !local_phrases[key]
+          puts "Delete unused context #{ key }, #{ value["uuid"] }"
+          delete_context(value[:uuid])
+        else
+          delete_unused_phrases_and_contexts(key, value, local_phrases[key])
+        end
+      else
+        puts "Delete unused phrases for context #{ name }, #{ value }"
+
+        for phrase_key in get_phrase_keys(value)
+          if !local_phrases[phrase_key]
+            if value == ARGV[1] # Consider if it moved to a sub context
+              c = find_context_for_phrase(phrase_key, contexts, local_phrases)
+              if c && !["Q", "A"].include?(phrase_key)
+                puts "Moving #{phrase_key} to #{ c }"
+                move_phrase_to_context(c)
+                next
+              end
+            end
+            puts "Delete #{ phrase_key } (SKIP)"
+            delete_phrase(value, phrase_key)
+          end
+        end
+      end
+    end
+  end
+
+  delete_unused_phrases_and_contexts(contexts.to_a[0][0], contexts["wallet_web"], local_phrases)
+
+
 when "cleanup"
   # This deletes all context except wallet_web. Don't use this.
   # for context in list_contexts().reverse
@@ -179,5 +340,6 @@ else
   puts "Usage: ./translations.rb [orphaned|upload]"
   puts "  orphaned: remove orphaned strings"
   puts "  upload: submit new strings, update modifed strings"
+  puts "  delete: remove orphaned strings, check for moves to a different context"
   exit 1
 end
